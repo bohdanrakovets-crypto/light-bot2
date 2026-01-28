@@ -25,10 +25,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = os.getenv("GROUP_ID") 
 SITE_URL = "https://voe-poweron.inneti.net/schedule_queues"
 
-# Налаштування кольору (синій графік)
-LOWER_BLUE = np.array([80, 60, 40])
-UPPER_BLUE = np.array([255, 180, 120])
-
 # --- ВАЖЛИВО: ІНДЕКС ЧЕРГИ ---
 # 0->1.1, 1->1.2, 2->2.1, 3->2.2, 4->3.1, 5->3.2, 6->4.1, 7->4.2
 TARGET_QUEUE_INDEX = 6 
@@ -52,7 +48,6 @@ def get_image_links_headless():
     found_urls = []
     try:
         driver.get(SITE_URL)
-        # Чекаємо поки завантажиться хоча б одна картинка
         try:
             WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "img")))
         except: pass
@@ -60,7 +55,6 @@ def get_image_links_headless():
         images = driver.find_elements(By.TAG_NAME, "img")
         for img in images:
             src = img.get_attribute("src")
-            # Фільтруємо лінки, шукаємо схожі на графіки
             if src and (("GPV" in src) or ("media" in src and ("png" in src or "jpg" in src))):
                  found_urls.append(src)
     except Exception as e:
@@ -70,14 +64,13 @@ def get_image_links_headless():
     return list(set(found_urls))
 
 def parse_date_only(img):
-    """Витягує дату з заголовка картинки через OCR."""
+    """Витягує дату."""
     try:
         h, w, _ = img.shape
         header_crop = img[0:int(h*0.15), 0:int(w*0.50)]
         gray = cv2.cvtColor(header_crop, cv2.COLOR_BGR2GRAY)
         gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
         
-        # Використовуємо tesseract. На GitHub Actions він встановлюється в систему.
         text = pytesseract.image_to_string(gray, lang='ukr+eng')
         dm = re.findall(r'(\d{2})\.(\d{2})\.(\d{4})', text)
         if dm:
@@ -87,26 +80,22 @@ def parse_date_only(img):
 
 def analyze_schedule_image(img):
     """
-    Аналізує графік, використовуючи HSV для точнішого визначення кольору.
+    Аналізує графік (HSV + точна сітка).
     """
     height, width, _ = img.shape
     debug_img = img.copy()
     
-    # 1. Конвертуємо зображення в HSV (це значно краще для розпізнавання кольорів)
+    # Конвертуємо в HSV
     hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     
-    # Визначаємо діапазон синього в HSV
-    # Hue (відтінок): 100-140 (синій колір в OpenCV це ~120)
-    # Saturation (насиченість): > 50 (щоб ігнорувати білий/сірий)
-    # Value (яскравість): > 50 (щоб ігнорувати чорний)
-    lower_blue_hsv = np.array([90, 50, 50])
-    upper_blue_hsv = np.array([130, 255, 255])
+    # Жорсткі налаштування кольору (синій, насичений)
+    lower_blue_hsv = np.array([90, 80, 50])
+    upper_blue_hsv = np.array([130, 255, 230])
     
-    # Створюємо маску: 255 там де синій, 0 де ні
     mask = cv2.inRange(hsv_img, lower_blue_hsv, upper_blue_hsv)
 
     rows_total = 12
-    # Координати блоків (залишаємо як було, вони виглядають правильними)
+    # Координати блоків по Y
     top_y_start = int(height * 0.19)
     top_y_end = int(height * 0.51)
     bottom_y_start = int(height * 0.58)
@@ -118,29 +107,28 @@ def analyze_schedule_image(img):
         block_h = y_end - y_start
         row_h = block_h / rows_total
         
-        # Центр рядка нашої черги
         y_center = int(y_start + (TARGET_QUEUE_INDEX * row_h) + (row_h / 2))
         
-        # Малюємо лінію сканування (зелена)
         cv2.line(debug_img, (0, y_center), (width, y_center), (0, 255, 0), 2)
         
-        # Трохи зсуваємо початок вправо (0.10 замість 0.095), щоб не зачепити рамку
-        x_start = int(width * 0.10) 
-        x_end = width
+        # --- ВИПРАВЛЕНА ГЕОМЕТРІЯ ---
+        # Починаємо трохи раніше (0.096) і закінчуємо трохи раніше (0.99),
+        # щоб сітка ідеально лягала на центри клітинок.
+        x_start = int(width * 0.096) 
+        x_end = int(width * 0.992)
         col_w = (x_end - x_start) / 24
         
         current_start = None
         for i in range(24):
             x_center = int(x_start + (i * col_w) + (col_w / 2))
             
-            # Малюємо точки перевірки
+            # Малюємо точки (щоб бачити в логах, куди бот "тикає")
             cv2.circle(debug_img, (x_center, y_center), 3, (0, 0, 255), -1)
             
             if y_center < height and x_center < width:
-                # Перевіряємо маску замість пікселів
-                # Якщо mask[y, x] > 0, значить це синій колір
                 is_blue = mask[y_center, x_center] > 0
                 
+                # Час = зсув години + (номер колонки * 0.5 години)
                 time_val = hour_offset + (i * 0.5)
                 
                 if is_blue:
@@ -158,21 +146,29 @@ def analyze_schedule_image(img):
     
     return outage_intervals, debug_img
 
+def format_time(t):
+    """Допоміжна функція для форматування 2.5 -> 02:30"""
+    h = int(t)
+    m = int((t - h) * 60)
+    return f"{h:02}:{m:02}"
+
 def format_intervals_to_string(intervals):
-    """Створює унікальний рядок-підпис для порівняння змін."""
+    """Створює підпис для порівняння (з хвилинами!)"""
     if not intervals: return "CLEAR"
     res = []
     for start, end in intervals:
-        res.append(f"{int(start):02}:00-{int(end):02}:00")
+        res.append(f"{format_time(start)}-{format_time(end)}")
     return "|".join(res)
 
 def format_intervals_pretty(intervals):
-    """Форматує текст для Telegram."""
+    """Форматує текст для Telegram (з хвилинами!)"""
     if not intervals: return "✅ Світло є (графік білий)."
     text = ""
     for start, end in intervals:
-        end_str = f"{int(end):02}:00" if end != 24 else "24:00"
-        text += f"⚫ `{int(start):02}:00 - {end_str}`\n"
+        start_str = format_time(start)
+        # Якщо кінець 24:00, пишемо гарно
+        end_str = "24:00" if end == 24 else format_time(end)
+        text += f"⚫ `{start_str} - {end_str}`\n"
     return text
 
 def load_state():
@@ -190,12 +186,10 @@ def save_state(state):
 
 async def main():
     if not BOT_TOKEN:
-        print("❌ Немає токена. Перевірте Secrets в GitHub.")
+        print("❌ Немає токена.")
         return
 
     bot = Bot(token=BOT_TOKEN)
-    
-    # 1. Отримуємо посилання
     urls = await asyncio.to_thread(get_image_links_headless)
     
     if not urls:
@@ -206,27 +200,19 @@ async def main():
     history = load_state()
     something_sent = False
 
-    print(f"🔍 Знайдено URL: {len(urls)}")
-
     for url in urls:
         try:
-            # Завантажуємо картинку
             resp = requests.get(url, timeout=20)
             img_arr = np.asarray(bytearray(resp.content), dtype=np.uint8)
             img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
             if img is None: continue
 
-            # 2. Визначаємо дату
             sched_date = parse_date_only(img)
-            if not sched_date: 
-                print(f"⚠️ Дата не прочиталась: {url}")
-                continue
+            if not sched_date: continue
             date_str = sched_date.strftime("%d.%m.%Y")
 
-            # 3. Аналізуємо графік
             intervals, debug_img = await asyncio.to_thread(analyze_schedule_image, img)
             
-            # 4. Перевіряємо зміни
             current_signature = format_intervals_to_string(intervals)
             last_saved_signature = history.get(date_str)
 
@@ -234,12 +220,9 @@ async def main():
                 print(f"💤 {date_str}: Без змін.")
                 continue
             
-            # Якщо є зміни
             if last_saved_signature:
-                print(f"🔥 ЗМІНИ! {date_str}")
                 status_text = "🔄 **ЗМІНИ В ГРАФІКУ! (Черга 4.1)**"
             else:
-                print(f"✅ Новий графік: {date_str}")
                 status_text = "⚡️ **Новий графік (Черга 4.1)**"
 
             text_schedule = format_intervals_pretty(intervals)
@@ -250,7 +233,6 @@ async def main():
                 f"{text_schedule}"
             )
 
-            # Відправляємо фото в Telegram
             is_success, buffer = cv2.imencode(".png", debug_img)
             if is_success:
                 io_buf = BytesIO(buffer)
@@ -265,12 +247,9 @@ async def main():
                 something_sent = True
 
         except Exception as e:
-            print(f"Error on URL {url}: {e}")
+            print(f"Error: {e}")
 
-    # Зберігаємо стан, щоб GitHub Actions зафіксував зміни
-    if something_sent: 
-        save_state(history)
-        
+    if something_sent: save_state(history)
     await bot.session.close()
 
 if __name__ == "__main__":
