@@ -87,14 +87,26 @@ def parse_date_only(img):
 
 def analyze_schedule_image(img):
     """
-    Аналізує пікселі на графіку для конкретної черги (TARGET_QUEUE_INDEX).
-    Повертає список годин відключення та картинку з розміткою.
+    Аналізує графік, використовуючи HSV для точнішого визначення кольору.
     """
     height, width, _ = img.shape
     debug_img = img.copy()
-    rows_total = 12
     
-    # Координати блоків графіку (емпірично підібрані під цей сайт)
+    # 1. Конвертуємо зображення в HSV (це значно краще для розпізнавання кольорів)
+    hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    
+    # Визначаємо діапазон синього в HSV
+    # Hue (відтінок): 100-140 (синій колір в OpenCV це ~120)
+    # Saturation (насиченість): > 50 (щоб ігнорувати білий/сірий)
+    # Value (яскравість): > 50 (щоб ігнорувати чорний)
+    lower_blue_hsv = np.array([90, 50, 50])
+    upper_blue_hsv = np.array([130, 255, 255])
+    
+    # Створюємо маску: 255 там де синій, 0 де ні
+    mask = cv2.inRange(hsv_img, lower_blue_hsv, upper_blue_hsv)
+
+    rows_total = 12
+    # Координати блоків (залишаємо як було, вони виглядають правильними)
     top_y_start = int(height * 0.19)
     top_y_end = int(height * 0.51)
     bottom_y_start = int(height * 0.58)
@@ -105,46 +117,42 @@ def analyze_schedule_image(img):
     def scan_block(y_start, y_end, hour_offset):
         block_h = y_end - y_start
         row_h = block_h / rows_total
-        # Знаходимо центр рядка нашої черги
+        
+        # Центр рядка нашої черги
         y_center = int(y_start + (TARGET_QUEUE_INDEX * row_h) + (row_h / 2))
         
         # Малюємо лінію сканування (зелена)
         cv2.line(debug_img, (0, y_center), (width, y_center), (0, 255, 0), 2)
         
-        x_start = int(width * 0.095)
+        # Трохи зсуваємо початок вправо (0.10 замість 0.095), щоб не зачепити рамку
+        x_start = int(width * 0.10) 
         x_end = width
         col_w = (x_end - x_start) / 24
         
         current_start = None
         for i in range(24):
             x_center = int(x_start + (i * col_w) + (col_w / 2))
-            # Малюємо точки перевірки (червоні)
-            cv2.circle(debug_img, (x_center, y_center), 2, (0, 0, 255), -1)
+            
+            # Малюємо точки перевірки
+            cv2.circle(debug_img, (x_center, y_center), 3, (0, 0, 255), -1)
             
             if y_center < height and x_center < width:
-                px = img[y_center, x_center]
-                # Перевірка на синій колір (ознака відключення)
-                is_blue = (LOWER_BLUE[0] <= px[0] <= UPPER_BLUE[0]) and \
-                          (LOWER_BLUE[1] <= px[1] <= UPPER_BLUE[1]) and \
-                          (LOWER_BLUE[2] <= px[2] <= UPPER_BLUE[2])
+                # Перевіряємо маску замість пікселів
+                # Якщо mask[y, x] > 0, значить це синій колір
+                is_blue = mask[y_center, x_center] > 0
                 
-                time_val = hour_offset + (i * 0.5) # Крок 30 хв, але тут грубо 1 клітинка = 1 година
-                
-                # Примітка: на цьому сайті 1 клітинка = 1 година.
-                # Якщо клітинка синя - значить відключення.
+                time_val = hour_offset + (i * 0.5)
                 
                 if is_blue:
-                    if current_start is None: current_start = hour_offset + i
+                    if current_start is None: current_start = time_val
                 else:
                     if current_start is not None:
-                        outage_intervals.append((current_start, hour_offset + i))
+                        outage_intervals.append((current_start, time_val))
                         current_start = None
                         
-        # Якщо ряд закінчився, а відключення триває
         if current_start is not None: 
             outage_intervals.append((current_start, hour_offset + 12))
 
-    # Скануємо верхній блок (00:00 - 12:00) і нижній (12:00 - 24:00)
     scan_block(top_y_start, top_y_end, 0)
     scan_block(bottom_y_start, bottom_y_end, 12)
     
